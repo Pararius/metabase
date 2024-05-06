@@ -325,7 +325,7 @@
            e)))
 
 (defn- execute-bigquery
-  ^TableResult [^BigQuery client ^String sql parameters cancel-chan cancel-requested?]
+  ^TableResult [^BigQuery client labels ^String sql parameters cancel-chan cancel-requested?]
   {:pre [client (not (str/blank? sql))]}
   (try
     (let [request (doto (QueryJobConfiguration/newBuilder sql)
@@ -336,7 +336,8 @@
                     ;; effect for RPC (a.k.a. "fast") calls
                     ;; there is no equivalent of .setMaxRows on a JDBC Statement; we rely on our middleware to stop
                     ;; realizing more rows as per the maximum result size
-                    (.setMaxResults *page-size*))
+                    (.setMaxResults *page-size*)
+                    (.setLabels labels))
           ;; as long as we don't set certain additional QueryJobConfiguration options, our queries *should* always be
           ;; following the fast query path (i.e. RPC)
           ;; check out com.google.cloud.bigquery.QueryRequestInfo.isFastQuerySupported for full details
@@ -367,9 +368,10 @@
       (throw-invalid-query e sql parameters))))
 
 (defn- execute-bigquery-on-db
-  ^TableResult [database sql parameters cancel-chan cancel-requested?]
+  ^TableResult [database labels sql parameters cancel-chan cancel-requested?]
   (execute-bigquery
    (database-details->client (:details database))
+   labels
    sql
    parameters
    cancel-chan
@@ -409,7 +411,7 @@
      (for [^FieldValueList row (fetch-page resp cancel-requested?)]
        (map parse-field-value row parsers)))))
 
-(defn- ^:dynamic *process-native* [respond database sql parameters cancel-chan]
+(defn- ^:dynamic *process-native* [respond database labels sql parameters cancel-chan]
   {:pre [(map? database) (map? (:details database))]}
   ;; automatically retry the query if it times out or otherwise fails. This is on top of the auto-retry added by
   ;; `execute`
@@ -418,6 +420,7 @@
                             (post-process-native respond
                                                  (execute-bigquery-on-db
                                                   database
+                                                  labels
                                                   sql
                                                   parameters
                                                   cancel-chan
@@ -437,6 +440,13 @@
     (qp.timezone/system-timezone-id)
     "UTC"))
 
+(defn- bigquery-labels
+  [{{:keys [executed-by dashboard-id card-id], :as _info} :info}]
+  (merge {"team" "analytics"}
+         (when executed-by {"metabase_user_id" executed-by})
+         (when dashboard-id {"metabase_dashboard_id" dashboard-id})
+         (when card-id {"metabase_card_id" card-id})))
+
 (defmethod driver/execute-reducible-query :bigquery-cloud-sdk
   [_ {{sql :query, :keys [params]} :native, :as outer-query} context respond]
   (let [database (lib.metadata/database (qp.store/metadata-provider))]
@@ -445,7 +455,7 @@
       (let [sql (if (get-in database [:details :include-user-id-and-hash] true)
                   (str "-- " (qp.util/query->remark :bigquery-cloud-sdk outer-query) "\n" sql)
                   sql)]
-        (*process-native* respond database sql params (qp.context/canceled-chan context))))))
+        (*process-native* respond database (bigquery-labels outer-query) sql params (qp.context/canceled-chan context))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                           Other Driver Method Impls                                            |
